@@ -23,12 +23,14 @@
 static GHashTable	*pipes_table;
 static GRWLock		pipes_table_lock;
 
-static struct ksmbd_rpc_pipe *rpc_pipe_lookup(unsigned int id)
+static struct ksmbd_rpc_pipe *rpc_pipe_get(unsigned int id)
 {
 	struct ksmbd_rpc_pipe *pipe;
 
 	g_rw_lock_reader_lock(&pipes_table_lock);
 	pipe = g_hash_table_lookup(pipes_table, &id);
+	if (pipe)
+		g_atomic_int_inc(&pipe->refcount);
 	g_rw_lock_reader_unlock(&pipes_table_lock);
 
 	return pipe;
@@ -46,15 +48,37 @@ static void __rpc_pipe_free(struct ksmbd_rpc_pipe *pipe)
 	g_free(pipe);
 }
 
+static void rpc_pipe_unref(struct ksmbd_rpc_pipe *pipe)
+{
+	if (g_atomic_int_dec_and_test(&pipe->refcount))
+		__rpc_pipe_free(pipe);
+}
+
+/*
+ * Remove the table entry and drop the table's reference. Only the caller
+ * that actually removes this pipe drops that reference. Checking the stored
+ * pointer prevents a stale close from removing a new pipe that reused the
+ * same numeric handle.
+ */
+static gboolean rpc_pipe_remove(struct ksmbd_rpc_pipe *pipe)
+{
+	gboolean removed = FALSE;
+
+	if (pipe->id == (unsigned int)-1)
+		return FALSE;
+
+	g_rw_lock_writer_lock(&pipes_table_lock);
+	if (g_hash_table_lookup(pipes_table, &pipe->id) == pipe)
+		removed = g_hash_table_remove(pipes_table, &pipe->id);
+	g_rw_lock_writer_unlock(&pipes_table_lock);
+
+	return removed;
+}
+
 static void rpc_pipe_free(struct ksmbd_rpc_pipe *pipe)
 {
-	if (pipe->id != (unsigned int)-1) {
-		g_rw_lock_writer_lock(&pipes_table_lock);
-		g_hash_table_remove(pipes_table, &(pipe->id));
-		g_rw_lock_writer_unlock(&pipes_table_lock);
-	}
-
-	__rpc_pipe_free(pipe);
+	rpc_pipe_remove(pipe);
+	rpc_pipe_unref(pipe);
 }
 
 static struct ksmbd_rpc_pipe *rpc_pipe_alloc(void)
@@ -66,6 +90,7 @@ static struct ksmbd_rpc_pipe *rpc_pipe_alloc(void)
 		return NULL;
 
 	pipe->id = -1;
+	g_atomic_int_set(&pipe->refcount, 1);
 	g_mutex_init(&pipe->lock);
 	return pipe;
 }
@@ -98,7 +123,7 @@ static void __clear_pipes_table(void)
 
 	g_rw_lock_writer_lock(&pipes_table_lock);
 	ghash_for_each_remove(pipe, pipes_table, iter)
-		__rpc_pipe_free(pipe);
+		rpc_pipe_unref(pipe);
 	g_rw_lock_writer_unlock(&pipes_table_lock);
 }
 
@@ -343,7 +368,7 @@ int rpc_ioctl_request(struct ksmbd_rpc_command *req,
 		      struct ksmbd_rpc_command *resp,
 		      int max_resp_sz)
 {
-	struct ksmbd_rpc_pipe *pipe = rpc_pipe_lookup(req->handle);
+	struct ksmbd_rpc_pipe *pipe = rpc_pipe_get(req->handle);
 	int ret;
 
 	if (!pipe)
@@ -351,6 +376,7 @@ int rpc_ioctl_request(struct ksmbd_rpc_command *req,
 	ret = libdcerpc_pipe_write(pipe, req);
 	if (ret == KSMBD_RPC_OK)
 		ret = libdcerpc_pipe_read(pipe, resp, max_resp_sz);
+	rpc_pipe_unref(pipe);
 	return ret;
 }
 
@@ -358,25 +384,31 @@ int rpc_read_request(struct ksmbd_rpc_command *req,
 		     struct ksmbd_rpc_command *resp,
 		     int max_resp_sz)
 {
-	struct ksmbd_rpc_pipe *pipe = rpc_pipe_lookup(req->handle);
+	struct ksmbd_rpc_pipe *pipe = rpc_pipe_get(req->handle);
+	int ret;
 
 	if (!pipe) {
 		pr_err("RPC: unknown pipe ID: %d\n", req->handle);
 		return KSMBD_RPC_EBAD_FID;
 	}
-	return libdcerpc_pipe_read(pipe, resp, max_resp_sz);
+	ret = libdcerpc_pipe_read(pipe, resp, max_resp_sz);
+	rpc_pipe_unref(pipe);
+	return ret;
 }
 
 int rpc_write_request(struct ksmbd_rpc_command *req,
 		      struct ksmbd_rpc_command *resp)
 {
-	struct ksmbd_rpc_pipe *pipe = rpc_pipe_lookup(req->handle);
+	struct ksmbd_rpc_pipe *pipe = rpc_pipe_get(req->handle);
+	int ret;
 
 	if (!pipe) {
 		pr_err("RPC: unknown pipe ID: %d\n", req->handle);
 		return KSMBD_RPC_EBAD_FID;
 	}
-	return libdcerpc_pipe_write(pipe, req);
+	ret = libdcerpc_pipe_write(pipe, req);
+	rpc_pipe_unref(pipe);
+	return ret;
 }
 
 int rpc_open_request(struct ksmbd_rpc_command *req,
@@ -385,8 +417,9 @@ int rpc_open_request(struct ksmbd_rpc_command *req,
 	struct ksmbd_rpc_pipe *pipe;
 	int ret;
 
-	pipe = rpc_pipe_lookup(req->handle);
+	pipe = rpc_pipe_get(req->handle);
 	if (pipe) {
+		rpc_pipe_unref(pipe);
 		pr_err("RPC: pipe ID collision: %d\n", req->handle);
 		return -EEXIST;
 	}
@@ -411,9 +444,11 @@ int rpc_close_request(struct ksmbd_rpc_command *req,
 {
 	struct ksmbd_rpc_pipe *pipe;
 
-	pipe = rpc_pipe_lookup(req->handle);
+	pipe = rpc_pipe_get(req->handle);
 	if (pipe) {
-		rpc_pipe_free(pipe);
+		if (rpc_pipe_remove(pipe))
+			rpc_pipe_unref(pipe);
+		rpc_pipe_unref(pipe);
 		return 0;
 	}
 

@@ -33,6 +33,7 @@ struct ksmbd_rpc_pipe {
 	struct dcerpc_server_pipe	*rpc;
 	unsigned int			req_flags;
 	GMutex				lock;
+	gint				refcount;
 	/* the context handles its stubs gave out, by id */
 	GHashTable			*handles;
 	unsigned int			next_handle;
